@@ -60,24 +60,50 @@ def get_os():
 
 def get_manpage(command):
     try:
-        get_logger().debug('Retrieving manpage for command "{}"'
-                           .format(command))
-        helppage = run(
-            ['fish', '-c', command + ' --help'],
-            stdout=PIPE,
-            stderr=DEVNULL)
-        if helppage.returncode == 0:
-            output = helppage.stdout.decode('utf-8')
+        get_logger().debug(f'Attempting to retrieve manpage for command "{command}" using "man".')
+        man_process = run(['man', command], stdout=PIPE, stderr=DEVNULL, timeout=5)
+        if man_process.returncode == 0:
+            output = man_process.stdout.decode('utf-8', errors='ignore')
             if len(output) > 2000:
                 return output[:2000] + ' [...]'
-            else:
+            elif output.strip(): # Ensure output is not empty
                 return output
-        return 'No manpage available.'
+            else:
+                get_logger().debug(f'"man {command}" produced empty output.')
+        else:
+            get_logger().debug(f'"man {command}" failed with return code {man_process.returncode}.')
+
+        # Fallback to 'command --help' via Zsh
+        get_logger().debug(f'Falling back to "{command} --help" via Zsh for command "{command}".')
+        # Ensure the command does not recursively call the script itself if it's part of zsh_ai
+        if command.startswith("zsh_ai_"): # Basic check to prevent recursion
+             get_logger().warning(f"Skipping zsh -c '{command} --help' to prevent potential recursion.")
+             return 'No manpage or help available.'
+
+        help_process = run(
+            ['zsh', '-c', f'{command} --help'],
+            stdout=PIPE,
+            stderr=DEVNULL,
+            timeout=5
+        )
+        if help_process.returncode == 0:
+            output = help_process.stdout.decode('utf-8', errors='ignore')
+            if len(output) > 2000:
+                return output[:2000] + ' [...]'
+            elif output.strip():
+                return output
+            else:
+                get_logger().debug(f'"{command} --help" via Zsh produced empty output.')
+        else:
+            get_logger().debug(f'"{command} --help" via Zsh failed with return code {help_process.returncode}.')
+
+        return 'No manpage or help available.'
+    except FileNotFoundError as e:
+        get_logger().error(f'Error retrieving manpage for "{command}": {e} (man or zsh command not found).')
+        return 'No manpage or help available (command not found).'
     except Exception as e:
-        get_logger().debug(
-            'Failed to retrieve manpage for command "{}". Reason: {}'.format(
-                command, str(e)))
-        return 'No manpage available.'
+        get_logger().error(f'Failed to retrieve manpage for command "{command}". Reason: {e}')
+        return 'No manpage or help available.'
 
 
 def get_file_info(words):
@@ -107,24 +133,56 @@ def get_commandline_history(commandline, cursor_position):
         get_logger().debug('Commandline history disabled.')
         return 'No commandline history available.'
 
-    def yield_history():
-        command = commandline.split(' ')[0]
+    def yield_history_zsh():
+        # command = commandline.split(' ')[0] # Not directly used in this simplified history search
         before_cursor = commandline[:cursor_position]
         after_cursor = commandline[cursor_position:]
 
-        proc = Popen(
-            ['fish', '-c', 'history search --prefix "{}"'.format(command)],
-            stdout=PIPE,
-            stderr=DEVNULL)
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            item = line.decode('utf-8').strip()
-            if item.startswith(before_cursor) and item.endswith(after_cursor):
-                yield item
+        histfile = expanduser(get_config('histfile') or '~/.zsh_history')
+        if not exists(histfile) or not access(histfile, R_OK):
+            get_logger().warning(f"Zsh history file not found or not readable at {histfile}.")
+            return
 
-    history = list(islice(yield_history(), history_size))
+        try:
+            with open(histfile, 'rb') as f: # Read as bytes to handle potential encoding issues
+                # Go to the end of the file
+                f.seek(0, 2)
+                file_size = f.tell()
+                
+                # Try to read the last N lines (approx. N*avg_line_length bytes)
+                # This is an estimation to avoid reading the whole file if it's huge.
+                # Average line length 80 chars, read last 200 lines => 16000 bytes.
+                # Max buffer size to read: 32KB
+                read_buffer_size = min(file_size, 32 * 1024) 
+                f.seek(file_size - read_buffer_size, 0)
+                lines_bytes = f.readlines()
+
+            # Decode lines, ignoring errors, and take the last `history_size` lines from the buffer
+            # Zsh history lines often start with ": <timestamp>:<duration>;<command>"
+            raw_lines = [line.decode('utf-8', errors='ignore').strip() for line in lines_bytes]
+            
+            # Filter for actual command lines (stripping metadata)
+            # and then apply the original filtering logic.
+            # Zsh history format: ": 162452 زيتون;:0;ls -la"
+            # We only care about the command part.
+            count = 0
+            for raw_line in reversed(raw_lines): # Process newest first
+                if count >= history_size:
+                    break
+                
+                # Basic parsing to extract command part
+                parts = raw_line.split(';', 1)
+                item = parts[1] if len(parts) > 1 else parts[0]
+                # Further strip leading timestamp like ": 1234567890:0;" if it wasn't caught by split
+                item = match(r": \d+:\d+;(.*)", item).group(1) if match(r": \d+:\d+;(.*)", item) else item
+
+                if item.startswith(before_cursor) and item.endswith(after_cursor):
+                    yield item
+                    count += 1
+        except Exception as e:
+            get_logger().error(f"Error reading Zsh history file {histfile}: {e}")
+
+    history = list(islice(yield_history_zsh(), history_size))
 
     if len(history) == 0:
         return 'No commandline history available.'
@@ -135,10 +193,9 @@ def get_system_prompt():
     return {
         'role': 'system',
         'content': textwrap.dedent('''\
-        You are a shell scripting assistant working inside a fish shell.
+        You are a shell scripting assistant working inside a zsh shell.
         The operating system is {os}. Your output must to be shell runnable.
-        You may consult Stack Overflow and the official Fish shell
-        documentation for answers.
+        You may consult Stack Overflow and the official Zsh documentation for answers.
         ''').format(os=get_os())
     }
 
@@ -246,7 +303,7 @@ def get_response(messages):
         email = get_config('email')
         password = get_config('api_key') or get_config('password')
         cookies = Login(email, password).login(
-            cookie_dir_path=expanduser('~/.fish-ai/cookies/'),
+            cookie_dir_path=expanduser('~/.zsh-ai/cookies/'),
             save_cookies=True)
 
         bot = hugchat.ChatBot(

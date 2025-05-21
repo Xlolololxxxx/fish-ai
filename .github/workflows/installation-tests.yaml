@@ -15,20 +15,41 @@ jobs:
     - uses: astral-sh/setup-uv@v6
       with:
         version: latest
-    - uses: fish-shop/install-fish-shell@v2
-    - name: Install Fisher plugin manager
-      uses: fish-shop/install-plugin-manager@v2
-      with:
-        plugin-manager: fisher
     - name: Install on macOS
-      shell: fish {0}
+      shell: zsh {0}
       run: |
         echo '::group:: 🏗 Show installation log'
-        fisher install .
+        # Source the main plugin file to make functions available
+        source ./zsh_dist/zsh-ai.plugin.zsh
+        # Run the installation function to set up the venv and dependencies
+        zsh_ai_install
+        echo "Plugin installation function 'zsh_ai_install' executed."
+        echo "Virtual environment path should be: ~/.zsh-ai"
+
+        # Verify python venv was created
+        if [ ! -d ~/.zsh-ai ]; then
+          echo "Virtual environment ~/.zsh-ai not found!"
+          exit 1
+        else
+          echo "Virtual environment ~/.zsh-ai found."
+        fi
+
+        # Verify pip dependencies were installed (check for a key package like 'openai' or 'google-generativeai')
+        # Assuming 'openai' is a core dependency. Adjust if needed.
+        echo "Checking for 'openai' package in venv..."
+        if ! ~/.zsh-ai/bin/pip list | grep -i openai; then
+             echo "Key dependency 'openai' not found in venv!"
+             echo "Installed packages:"
+             ~/.zsh-ai/bin/pip list
+             exit 1
+        else
+          echo "'openai' package found."
+        fi
         echo '::endgroup::'
 
         echo '::group:: 🐞 Show bug report'
-        fish_ai_bug_report
+        # Ensure the bug report function is available after sourcing and installation
+        zsh_ai_bug_report
         echo '::endgroup::'
 
   linux-installation-tests:
